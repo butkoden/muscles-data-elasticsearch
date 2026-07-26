@@ -8,7 +8,14 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from muscles_data.config import DataResourceConfig
-from muscles_data.errors import DataError
+from muscles_data.errors import (
+    DataConfigurationError,
+    DataConnectionError,
+    DataResourceMissingError,
+    DataSchemaMismatchError,
+    DataUnsupportedOperationError,
+    DataError,
+)
 from muscles_data.models import DataCapability, HealthResult, InspectResult, SearchHit, WriteResult
 
 
@@ -16,6 +23,7 @@ _CLIENT_UNSET = object()
 _RANGE_OPERATORS = {"gt", "gte", "lt", "lte"}
 _ALLOWED_OPTIONS = {
     "url",
+    "url_env",
     "api_key",
     "username",
     "password",
@@ -26,6 +34,16 @@ _ALLOWED_OPTIONS = {
     "native_client",
     "text_field",
     "metadata_field",
+    "mapping",
+    "settings",
+}
+
+DEFAULT_INDEX_MAPPING = {
+    "properties": {
+        "text": {"type": "text"},
+        "title": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+        "metadata": {"type": "object", "dynamic": True},
+    }
 }
 
 
@@ -33,20 +51,28 @@ class ElasticsearchAdapterError(DataError):
     """Base error for Elasticsearch search adapter failures."""
 
 
-class ElasticsearchConfigError(ValueError, ElasticsearchAdapterError):
+class ElasticsearchConfigError(ValueError, DataConfigurationError, ElasticsearchAdapterError):
     """Raised when an Elasticsearch resource config cannot be mapped safely."""
 
 
-class ElasticsearchClientMissingError(ElasticsearchAdapterError):
+class ElasticsearchClientMissingError(DataConfigurationError, ElasticsearchAdapterError):
     """Raised when Elasticsearch adapter is used without an available client."""
 
 
-class ElasticsearchConnectionError(ElasticsearchAdapterError):
+class ElasticsearchConnectionError(DataConnectionError, ElasticsearchAdapterError):
     """Raised when an Elasticsearch operation cannot reach or use the backend."""
 
 
-class ElasticsearchFilterError(ElasticsearchAdapterError):
+class ElasticsearchFilterError(DataUnsupportedOperationError, ElasticsearchAdapterError):
     """Raised when a data filter cannot be translated to Elasticsearch."""
+
+
+class ElasticsearchSchemaError(DataSchemaMismatchError, ElasticsearchAdapterError):
+    """Raised when the configured index mapping cannot be prepared."""
+
+
+class ElasticsearchResourceMissingError(DataResourceMissingError, ElasticsearchAdapterError):
+    """Raised when an index is missing and cannot be created."""
 
 
 class ElasticsearchSearchAdapter:
@@ -62,6 +88,7 @@ class ElasticsearchSearchAdapter:
         self._client_factory = client_factory
         self._client: Any = _CLIENT_UNSET
         self._lock = threading.RLock()
+        self._index_ready = False
         self.closed = False
 
     def search_text(
@@ -98,17 +125,31 @@ class ElasticsearchSearchAdapter:
         options = dict(options or {})
         client = self._client_instance()
         try:
+            operations: list[dict[str, Any]] = []
             for item in items:
                 document_id = str(item["id"])
-                kwargs: dict[str, Any] = {
-                    "index": self.index_name(),
-                    "id": document_id,
-                    "document": self._document_from_item(item),
-                }
+                operations.extend(
+                    [
+                        {"index": {"_index": self.index_name(), "_id": document_id}},
+                        self._document_from_item(item),
+                    ]
+                )
+            bulk = getattr(client, "bulk", None)
+            if callable(bulk):
+                kwargs: dict[str, Any] = {"operations": operations}
                 for key in ("refresh", "routing", "pipeline"):
                     if key in options:
                         kwargs[key] = options[key]
-                client.index(**kwargs)
+                response = bulk(**kwargs)
+                if bool(_mapping_get(response, "errors", False)):
+                    raise ElasticsearchConnectionError("Elasticsearch bulk upsert reported item errors")
+            else:
+                for item in items:
+                    client.index(
+                        index=self.index_name(),
+                        id=str(item["id"]),
+                        document=self._document_from_item(item),
+                    )
         except KeyError as exc:
             raise ElasticsearchConfigError(f"Elasticsearch document item requires {exc.args[0]}") from exc
         except (ElasticsearchClientMissingError, ElasticsearchConfigError, ElasticsearchFilterError):
@@ -160,7 +201,7 @@ class ElasticsearchSearchAdapter:
                 initialized=self._client is not _CLIENT_UNSET,
                 status="ok",
                 options=self.config.safe_options(),
-                details={"backend": "elasticsearch", "index": self.index_name()},
+                details={"backend": "elasticsearch", "index": self.index_name(), "mapping": self.mapping()},
             )
         )
 
@@ -171,22 +212,30 @@ class ElasticsearchSearchAdapter:
             if callable(ping) and not bool(ping()):
                 return HealthResult(
                     status="failed",
+                    code="connection_failed",
                     message="Elasticsearch ping failed",
                     details={"index": self.index_name()},
                 )
             indices = getattr(client, "indices", None)
-            exists = True
-            if indices is not None and hasattr(indices, "exists"):
+            exists = self._index_ready
+            if not exists and indices is not None and hasattr(indices, "exists"):
                 exists = bool(indices.exists(index=self.index_name()))
+        except ElasticsearchResourceMissingError as exc:
+            return HealthResult(status="failed", code="resource_missing", message=str(exc), details={"index": self.index_name()})
+        except ElasticsearchSchemaError as exc:
+            return HealthResult(status="failed", code="schema_mismatch", message=str(exc), details={"index": self.index_name()})
+        except DataConfigurationError as exc:
+            return HealthResult(status="failed", code="configuration_error", message=str(exc), details={"index": self.index_name()})
         except Exception as exc:
-            return HealthResult(status="failed", message=self._safe_error(exc), details={"index": self.index_name()})
+            return HealthResult(status="failed", code="connection_failed", message=self._safe_error(exc), details={"index": self.index_name()})
         if not exists:
             return HealthResult(
                 status="failed",
+                code="resource_missing",
                 message=f"Elasticsearch index '{self.index_name()}' is not available",
                 details={"index": self.index_name()},
             )
-        return HealthResult(status="ok", message="Elasticsearch index is available", details={"index": self.index_name()})
+        return HealthResult(status="ok", code="ok", message="Elasticsearch index is available", details={"index": self.index_name()})
 
     def close(self) -> None:
         if self._client is _CLIENT_UNSET:
@@ -201,7 +250,18 @@ class ElasticsearchSearchAdapter:
         return self._client_instance()
 
     def index_name(self) -> str:
-        return str(self.config.options["index"])
+        try:
+            return str(self.config.options["index"])
+        except KeyError as exc:
+            raise ElasticsearchConfigError("Elasticsearch resource requires index") from exc
+
+    def mapping(self) -> dict[str, Any]:
+        mapping = self.config.options.get("mapping")
+        if mapping is None:
+            return dict(DEFAULT_INDEX_MAPPING)
+        if not isinstance(mapping, Mapping):
+            raise ElasticsearchConfigError("Elasticsearch mapping must be a mapping")
+        return dict(mapping)
 
     def text_field(self) -> str:
         return str(self.config.options.get("text_field", "text"))
@@ -231,6 +291,8 @@ class ElasticsearchSearchAdapter:
             self.text_field(): str(item.get("text", "")),
             self.metadata_field(): metadata,
         }
+        if item.get("title") is not None:
+            document["title"] = str(item["title"])
         fields = item.get("fields")
         if isinstance(fields, Mapping):
             document.update(dict(fields))
@@ -249,6 +311,14 @@ class ElasticsearchSearchAdapter:
                     if client is None:
                         raise ElasticsearchClientMissingError("Elasticsearch client is not available")
                     self._client = client
+                    try:
+                        self._ensure_index(client)
+                    except Exception:
+                        self._client = _CLIENT_UNSET
+                        close = getattr(client, "close", None)
+                        if callable(close):
+                            close()
+                        raise
         return self._client
 
     def _validate_options(self) -> None:
@@ -256,13 +326,43 @@ class ElasticsearchSearchAdapter:
         if unknown:
             names = ", ".join(unknown)
             raise ElasticsearchConfigError(f"Unsupported Elasticsearch resource options: {names}")
+        if not self.config.options.get("url") and not self.config.options.get("url_env"):
+            raise ElasticsearchConfigError("Elasticsearch resource requires url_env")
         basic_auth = self.config.options.get("basic_auth")
         if basic_auth is not None and (not isinstance(basic_auth, (list, tuple)) or len(basic_auth) != 2):
             raise ElasticsearchConfigError("Elasticsearch basic_auth must contain username and password")
 
+    def _ensure_index(self, client: Any) -> None:
+        indices = getattr(client, "indices", None)
+        exists = getattr(indices, "exists", None)
+        create = getattr(indices, "create", None)
+        if not callable(exists) or not callable(create):
+            return
+        try:
+            if bool(exists(index=self.index_name())):
+                self._index_ready = True
+                return
+            kwargs: dict[str, Any] = {"index": self.index_name(), "mappings": self.mapping()}
+            settings = self.config.options.get("settings")
+            if settings is not None:
+                kwargs["settings"] = settings
+            create(**kwargs)
+            self._index_ready = True
+        except Exception as exc:
+            message = self._safe_error(exc)
+            if "already exists" in message.lower() or "resource_already_exists" in message.lower():
+                return
+            if "mapping" in message.lower() or "schema" in message.lower():
+                raise ElasticsearchSchemaError(message) from exc
+            raise ElasticsearchResourceMissingError(message) from exc
+
     def _safe_error(self, exc: Exception) -> str:
         message = str(exc)
-        for key, value in self.config.options.items():
+        try:
+            options = self.config.resolved_options()
+        except DataConfigurationError:
+            options = self.config.options
+        for key, value in options.items():
             if key in {"url", "api_key", "password", "basic_auth"} and value:
                 if isinstance(value, (list, tuple)):
                     for item in value:
@@ -370,6 +470,7 @@ def _hit_from_response(hit: Mapping[str, Any], *, text_field: str, metadata_fiel
         id=str(hit.get("_id", "")),
         score=float(hit.get("_score", 0.0) or 0.0),
         text=source.get(text_field),
+        title=source.get("title"),
         metadata=metadata,
         highlights=highlights,
     )
@@ -394,19 +495,20 @@ def _default_elasticsearch_client(config: DataResourceConfig):
     except Exception as exc:
         raise ElasticsearchClientMissingError("Install elasticsearch or muscles-data-elasticsearch to use type=elasticsearch") from exc
 
+    options = config.resolved_options()
     kwargs: dict[str, Any] = {}
-    if config.options.get("api_key"):
-        kwargs["api_key"] = config.options["api_key"]
-    if config.options.get("basic_auth"):
-        kwargs["basic_auth"] = tuple(config.options["basic_auth"])
-    elif config.options.get("username") or config.options.get("password"):
-        kwargs["basic_auth"] = (config.options.get("username"), config.options.get("password"))
-    if config.options.get("timeout") is not None:
-        kwargs["request_timeout"] = config.options["timeout"]
-    if config.options.get("verify_certs") is not None:
-        kwargs["verify_certs"] = bool(config.options["verify_certs"])
+    if options.get("api_key"):
+        kwargs["api_key"] = options["api_key"]
+    if options.get("basic_auth"):
+        kwargs["basic_auth"] = tuple(options["basic_auth"])
+    elif options.get("username") or options.get("password"):
+        kwargs["basic_auth"] = (options.get("username"), options.get("password"))
+    if options.get("timeout") is not None:
+        kwargs["request_timeout"] = options["timeout"]
+    if options.get("verify_certs") is not None:
+        kwargs["verify_certs"] = bool(options["verify_certs"])
 
     try:
-        return client_module.Elasticsearch(config.options["url"], **kwargs)
+        return client_module.Elasticsearch(options["url"], **kwargs)
     except Exception as exc:
         raise ElasticsearchConnectionError(str(exc)) from exc

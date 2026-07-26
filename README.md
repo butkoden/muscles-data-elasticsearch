@@ -49,16 +49,20 @@ data:
   resources:
     search.elastic:
       type: elasticsearch
-      url: ${ELASTICSEARCH_URL}
+      url_env: ELASTICSEARCH_URL
       api_key: ${ELASTICSEARCH_API_KEY}
       index: docs
       timeout: 3
       verify_certs: true
 ```
 
-The adapter creates the Elasticsearch client lazily on search, index/delete,
+The adapter creates the Elasticsearch client and index lazily on search, index/delete,
 explicit native access or `data.doctor`. Application code should use
 `SearchIndexPort`; direct client access is only an advanced escape hatch with
 `native_client: true`.
+
+Missing indexes are created with a default mapping for `text`, `title` and
+`metadata`; `mapping` and `settings` resource options can customize it.
+`upsert_documents()` uses Elasticsearch bulk operations.
 
 See `muscular-example/example_data_elasticsearch_1` for an executable example.

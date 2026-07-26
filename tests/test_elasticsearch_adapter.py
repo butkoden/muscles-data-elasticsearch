@@ -26,12 +26,18 @@ class FakeIndices:
             raise TimeoutError("elastic password=secret timed out")
         return index == "docs"
 
+    def create(self, *, index: str, mappings: dict, settings: dict | None = None):
+        self.client.created_indices.append({"index": index, "mappings": mappings, "settings": settings})
+        return {"acknowledged": True}
+
 
 class FakeElasticsearchClient:
     def __init__(self, *, fail_health: bool = False) -> None:
         self.fail_health = fail_health
         self.searches: list[dict] = []
         self.indexes: list[dict] = []
+        self.bulks: list[dict] = []
+        self.created_indices: list[dict] = []
         self.deletes: list[dict] = []
         self.delete_queries: list[dict] = []
         self.index_checks: list[str] = []
@@ -56,6 +62,10 @@ class FakeElasticsearchClient:
     def index(self, **kwargs):
         self.indexes.append(kwargs)
         return {"result": "created"}
+
+    def bulk(self, **kwargs):
+        self.bulks.append(kwargs)
+        return {"errors": False, "items": []}
 
     def delete(self, **kwargs):
         self.deletes.append(kwargs)
@@ -114,7 +124,7 @@ def test_elasticsearch_external_adapter_maps_search_index_delete_and_native_acce
     assert hits[0].highlights["text"] == ["<em>Muscles</em> data ports"]
     assert client.searches[0]["query"]["bool"]["filter"] == [{"term": {"metadata.section": "docs"}}]
     assert write.written == 1
-    assert client.indexes[0]["document"]["metadata"] == {"section": "docs"}
+    assert client.bulks[0]["operations"][1]["metadata"] == {"section": "docs"}
     assert deleted.deleted == 3
     assert client.delete_queries[0]["query"]["bool"]["filter"][0] == {"terms": {"metadata.section": ["docs", "notes"]}}
     assert runtime.require_resource("search.elastic", DataCapability.NATIVE_CLIENT).native_client() is client
@@ -142,3 +152,40 @@ def test_elasticsearch_external_adapter_filters_and_safe_failures():
     bad_client.search = lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("network unavailable"))
     with pytest.raises(ElasticsearchConnectionError):
         _runtime(bad_client).require_port("search.elastic", SearchIndexPort).search_text("x")
+
+
+def test_elasticsearch_creates_missing_index_with_mapping_and_resolves_url_env(monkeypatch):
+    monkeypatch.setenv("ELASTICSEARCH_URL", "https://elastic.example")
+    client = FakeElasticsearchClient()
+    client.indices.exists = lambda *, index: False
+    captured: list[dict] = []
+    catalog = DataAdapterCatalog.with_defaults()
+    catalog.register(
+        ElasticsearchSearchFactory(
+            client_factory=lambda config: captured.append(config.resolved_options()) or client
+        )
+    )
+    runtime = DataRuntime(
+        config=DataConfig.from_raw(
+            {
+                "data": {
+                    "resources": {
+                        "search.elastic": {
+                            "type": "elasticsearch",
+                            "url_env": "ELASTICSEARCH_URL",
+                            "index": "assetforge-rag",
+                        }
+                    }
+                }
+            }
+        ),
+        catalog=catalog,
+    )
+
+    runtime.require_port("search.elastic", SearchIndexPort).upsert_documents(
+        [{"id": "doc-1", "title": "Title", "text": "content", "metadata": {"status": "ready"}}]
+    )
+
+    assert captured == [{"url_env": "ELASTICSEARCH_URL", "index": "assetforge-rag", "url": "https://elastic.example"}]
+    assert client.created_indices[0]["index"] == "assetforge-rag"
+    assert client.created_indices[0]["mappings"]["properties"]["text"]["type"] == "text"
