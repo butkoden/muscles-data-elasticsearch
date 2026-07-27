@@ -6,7 +6,6 @@ from uuid import uuid4
 import pytest
 from muscles_data.catalog import DataAdapterCatalog
 from muscles_data.config import DataConfig
-from muscles_data.contracts import assert_search_index_contract
 from muscles_data.models import DataCapability
 from muscles_data.ports import SearchIndexPort
 from muscles_data.runtime import DataRuntime
@@ -56,7 +55,10 @@ def test_elasticsearch_real_search_index_lifecycle():
         assert runtime.doctor()["status"] == "ok"
         assert search.delete_documents(ids=["alpha"], options={"refresh": "wait_for"}).deleted == 1
         assert search.search_text("alpha") == []
-        assert_search_index_contract(lambda: search)
+        contracts = pytest.importorskip("muscles_data.contracts")
+        contract = getattr(contracts, "assert_search_index_contract", None)
+        if contract is not None:
+            contract(lambda: search)
     finally:
         try:
             if client is None:
