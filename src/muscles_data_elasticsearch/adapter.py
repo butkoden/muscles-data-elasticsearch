@@ -141,8 +141,15 @@ class ElasticsearchSearchAdapter:
                     if key in options:
                         kwargs[key] = options[key]
                 response = bulk(**kwargs)
-                if bool(_mapping_get(response, "errors", False)):
-                    raise ElasticsearchConnectionError("Elasticsearch bulk upsert reported item errors")
+                errors = _bulk_error_messages(response)
+                if errors:
+                    written = max(0, len(items) - len(errors))
+                    return WriteResult(
+                        status="partial" if written else "failed",
+                        written=written,
+                        matched=written,
+                        errors=errors,
+                    )
             else:
                 for item in items:
                     client.index(
@@ -487,6 +494,26 @@ def _mapping_get(value: Any, key: str, default: Any = None) -> Any:
         return value[key]
     except Exception:
         return default
+
+
+def _bulk_error_messages(response: Any) -> list[str]:
+    """Extract actionable per-document errors from an Elasticsearch bulk reply."""
+    if not bool(_mapping_get(response, "errors", False)):
+        return []
+    messages: list[str] = []
+    items = _mapping_get(response, "items", []) or []
+    for item in items:
+        if not isinstance(item, Mapping) or not item:
+            continue
+        operation, result = next(iter(item.items()))
+        if not isinstance(result, Mapping):
+            continue
+        error = result.get("error")
+        status = int(result.get("status", 0) or 0)
+        if error or status >= 300:
+            detail = error if error is not None else f"status={status}"
+            messages.append(f"{operation}: {detail}")
+    return messages or ["Elasticsearch bulk upsert reported item errors"]
 
 
 def _default_elasticsearch_client(config: DataResourceConfig):

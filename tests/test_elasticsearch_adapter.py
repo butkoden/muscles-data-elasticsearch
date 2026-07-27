@@ -134,6 +134,24 @@ def test_elasticsearch_external_adapter_maps_search_index_delete_and_native_acce
     assert client.closed is True
 
 
+def test_elasticsearch_bulk_upsert_returns_actionable_partial_result():
+    client = FakeElasticsearchClient()
+    client.bulk = lambda **_kwargs: {
+        "errors": True,
+        "items": [
+            {"index": {"status": 400, "error": {"type": "mapper_parsing_exception", "reason": "bad field"}}},
+            {"index": {"status": 201}},
+        ],
+    }
+    search = _runtime(client).require_port("search.elastic", SearchIndexPort)
+
+    result = search.upsert_documents([{"id": "bad"}, {"id": "good"}])
+
+    assert result.status == "partial"
+    assert result.written == 1
+    assert result.errors == ["index: {'type': 'mapper_parsing_exception', 'reason': 'bad field'}"]
+
+
 def test_elasticsearch_external_adapter_filters_and_safe_failures():
     translated = elasticsearch_filter_from_mapping({"score": {"gte": 0.5}, "$not": {"archived": True}})
     assert translated[0] == {"bool": {"must_not": [{"term": {"metadata.archived": True}}]}}
